@@ -1,111 +1,98 @@
-name: Build and release Aseprite
+name: Build Aseprite
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'BuildLog.md'
-  workflow_dispatch:
+  workflow_dispatch: # Allows you to run it manually
 
 env:
   BUILD_TYPE: Release
 
 jobs:
-  # STEP 1: Get the latest version tag directly from Aseprite's official API
-  fetch-aseprite-info:
-    name: Fetch deps info
+  fetch-version:
     runs-on: ubuntu-latest
     outputs:
-      release-tag: ${{ steps.get-tag.outputs.tag }}
+      tag: ${{ steps.get-tag.outputs.tag }}
     steps:
-      - name: Get latest Aseprite tag
-        id: get-tag
-        shell: bash
+      - id: get-tag
         run: |
-          # Safe way to get the version without third-party actions
           TAG=$(curl -s https://api.github.com/repos/aseprite/aseprite/releases/latest | jq -r .tag_name)
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
-  # STEP 2: Compile Aseprite for Windows, Linux, and macOS
-  build-aseprite:
-    name: Build Aseprite
-    needs: fetch-aseprite-info
-    permissions:
-      contents: write
+  build:
+    needs: fetch-version
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
-      fail-fast: false
-
     steps:
-      - name: Install Linux Dependencies
+      - name: Install Dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
-          libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev libfontconfig1-dev
+          sudo apt-get update
+          sudo apt-get install -y libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev libfontconfig1-dev
 
       - uses: actions/checkout@v4
+      
+      # We use the version fetched in the first job
+      - name: Clone Aseprite
+        run: git clone --recurse-submodules -j8 https://github.com/aseprite/aseprite --branch ${{ needs.fetch-version.outputs.tag }}
 
-      - name: Clone Aseprite Source
-        shell: bash
-        run: |
-          git clone --recurse-submodules -j8 https://github.com/aseprite/aseprite --branch ${{ needs.fetch-aseprite-info.outputs.release-tag }}
+      # Install Ninja via a more reliable method
+      - name: Setup Ninja
+        uses: ashley-wolf/get-ninja@main
 
-      - name: Install Skia
-        working-directory: aseprite
-        shell: bash
-        run: |
-          if [[ "${{ runner.os }}" == "Windows" ]] ; then
-            wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Windows-Release-x64.zip
-            unzip Skia-Windows-Release-x64.zip -d skia
-          elif [[ "${{ runner.os }}" == "macOS" ]] ; then
-            wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-macOS-Release-arm64.zip
-            unzip Skia-macOS-Release-arm64.zip -d skia
-          else
-            wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Linux-Release-x64.zip
-            unzip Skia-Linux-Release-x64.zip -d skia
-          fi
-
-      - uses: aseprite/get-ninja@main
-      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Setup MSVC (Windows)
         if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Generating Makefiles
-        shell: bash
+      - name: Download Skia
         working-directory: aseprite
+        shell: bash
         run: |
-          if [[ "${{ runner.os }}" == "macOS" ]] ; then
-            export skia_arch=arm64
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            curl -L -o skia.zip https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Windows-Release-x64.zip
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            curl -L -o skia.zip https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-macOS-Release-arm64.zip
           else
-            export skia_arch=x64
+            curl -L -o skia.zip https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Linux-Release-x64.zip
           fi
+          unzip skia.zip -d skia
 
+      - name: Run CMake
+        working-directory: aseprite
+        shell: bash
+        run: |
+          # Detect Skia arch
+          [[ "${{ runner.os }}" == "macOS" ]] && SKIA_ARCH="arm64" || SKIA_ARCH="x64"
+          
           cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DENABLE_TESTS=OFF \
-            -DENABLE_SCRIPTING=ON \
+            -DCMAKE_BUILD_TYPE=Release \
             -DLAF_BACKEND=skia \
             -DSKIA_DIR=$(realpath skia) \
-            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch)
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$SKIA_ARCH) \
+            -DENABLE_TESTS=OFF
 
-      - name: Compiling
+      - name: Run Ninja Build
         working-directory: aseprite/build
         run: ninja aseprite
 
-      - name: Create Portable Bundle
+      - name: Package
         working-directory: aseprite/build/bin
         shell: bash
         run: |
-          echo '# Portable Mode' > aseprite.ini
-          # Keep only the essential app files
-          find . -mindepth 1 ! \( -name 'aseprite' -o -name 'aseprite.exe' -o -name 'data' -prune -o -name 'Aseprite.app' -prune -o -name 'aseprite.ini' \) -exec rm -rf {} +
-          zip -r Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}-${{ runner.os }}.zip *
+          # Simple packaging: only the exe/app and the data folder
+          mkdir output
+          cp -r data output/
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp aseprite.exe output/
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            cp -r Aseprite.app output/
+          else
+            cp aseprite output/
+          fi
+          cd output && zip -r ../Aseprite-Build.zip *
 
-      - name: Upload Artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: Aseprite-${{ runner.os }}
-          path: aseprite/build/bin/*.zip
+          path: aseprite/build/bin/Aseprite-Build.zip
